@@ -1,4 +1,4 @@
-# shadowtunnel
+# shadowtunnel http proxy
 Secure HTTP/HTTPS proxy tunnel with encryption
 
 This library provides a secure tunnel that works as an encrypted HTTP/HTTPS proxy. It allows you to route HTTP and HTTPS traffic through an encrypted connection to bypass censorship or protect your traffic.
