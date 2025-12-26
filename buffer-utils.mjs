@@ -11,10 +11,10 @@ export class PacketParser {
 
   process() {
     while (true) {
-      if (this.buffer.length < 4) return; // Ждем хотя бы заголовок длины
+      if (this.buffer.length < 4) return;
 
       const length = this.buffer.readUInt32BE(0);
-      
+
       if (this.buffer.length < 4 + length) return;
 
       const message = this.buffer.subarray(4, 4 + length);
