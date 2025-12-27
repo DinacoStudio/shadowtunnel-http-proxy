@@ -29,6 +29,11 @@ const serverPubKey = crypto.createPublicKey(
   fs.readFileSync("./server_identity.pub")
 );
 
+const RECONNECT_BASE_MS = 500;
+const RECONNECT_MAX_MS = 15_000;
+const RECONNECT_FACTOR = 2;
+const MAX_PENDING_SEND = 10_000;
+
 function makeFrame(op, connId, payload = Buffer.alloc(0)) {
   const b = Buffer.alloc(1 + 4);
   b.writeUInt8(op, 0);
@@ -36,8 +41,11 @@ function makeFrame(op, connId, payload = Buffer.alloc(0)) {
   return Buffer.concat([b, payload]);
 }
 
-const tunnelSocket = new net.Socket();
-const { publicKey: cPub, privateKey: cPriv } = generateEphemeralKeys();
+let tunnelSocket = null;
+let parser = null;
+
+let cPub = null;
+let cPriv = null;
 
 let sharedKey = null;
 let sSeq = 0n;
@@ -45,19 +53,97 @@ let rSeq = 0n;
 let handshakeDone = false;
 
 const pendingSend = [];
-
 const clientSockets = new Map();
 const pendingOpen = new Map();
 
+let reconnectTimer = null;
+let reconnectAttempt = 0;
+let shuttingDown = false;
+
+function isTunnelReady() {
+  return (
+    !!tunnelSocket &&
+    !tunnelSocket.destroyed &&
+    handshakeDone === true &&
+    sharedKey !== null
+  );
+}
+
+function resetCryptoState() {
+  const keys = generateEphemeralKeys();
+  cPub = keys.publicKey;
+  cPriv = keys.privateKey;
+
+  sharedKey = null;
+  sSeq = 0n;
+  rSeq = 0n;
+  handshakeDone = false;
+
+  pendingSend.length = 0;
+}
+
+function cleanupActiveWork(err) {
+  for (const [, p] of pendingOpen) {
+    try {
+      p.reject(err ?? new Error("Tunnel disconnected"));
+    } catch {}
+  }
+  pendingOpen.clear();
+  for (const [, s] of clientSockets) {
+    try {
+      s.destroy();
+    } catch {}
+  }
+  clientSockets.clear();
+}
+
+function scheduleReconnect(reason = "unknown") {
+  if (shuttingDown) return;
+  if (reconnectTimer) return;
+
+  const delay = Math.min(
+    RECONNECT_MAX_MS,
+    Math.floor(RECONNECT_BASE_MS * Math.pow(RECONNECT_FACTOR, reconnectAttempt))
+  );
+
+  console.error(
+    `Туннель упал (${reason}). Переподключение через ${delay}ms...`
+  );
+
+  reconnectAttempt = Math.min(reconnectAttempt + 1, 30);
+
+  reconnectTimer = setTimeout(() => {
+    reconnectTimer = null;
+    connectTunnel();
+  }, delay);
+}
+
+function destroyTunnelSocket() {
+  if (!tunnelSocket) return;
+  try {
+    tunnelSocket.removeAllListeners();
+  } catch {}
+  try {
+    tunnelSocket.destroy();
+  } catch {}
+  tunnelSocket = null;
+  parser = null;
+}
+
 function sendEncrypted(plainBuf) {
   if (!handshakeDone) {
-    pendingSend.push(plainBuf);
+    if (pendingSend.length < MAX_PENDING_SEND) pendingSend.push(plainBuf);
     return;
   }
+  if (!tunnelSocket || tunnelSocket.destroyed) {
+    throw new Error("Tunnel socket is not connected");
+  }
+
   const enc = encrypt(plainBuf, sharedKey, sSeq++);
   const h = Buffer.alloc(5);
   h.writeUInt32BE(enc.length, 0);
   h.writeUInt8(MSG_DATA, 4);
+
   tunnelSocket.write(Buffer.concat([h, enc]));
 }
 
@@ -77,6 +163,7 @@ function readHeadersOnce(socket) {
       buf = Buffer.concat([buf, chunk]);
       const idx = buf.indexOf("\r\n\r\n");
       if (idx === -1) return;
+
       socket.off("data", onData);
       const head = buf.subarray(0, idx + 4);
       const rest = buf.subarray(idx + 4);
@@ -92,11 +179,10 @@ function readHeadersOnce(socket) {
 function parseHeaders(headBuf) {
   const s = headBuf.toString("latin1");
   const lines = s.split("\r\n");
-
   const requestLine = lines[0] || "";
   const [method, rawUrl, version] = requestLine.split(" ");
-
   const headers = [];
+
   for (let i = 1; i < lines.length; i++) {
     const line = lines[i];
     if (!line) continue;
@@ -130,6 +216,7 @@ function buildHttpForwardRequest(method, rawUrl, version, headers) {
   } else {
     const hostHeader = getHeader(headers, "host");
     if (!hostHeader) throw new Error("No Host header");
+
     const hh = hostHeader.trim();
     const idx = hh.lastIndexOf(":");
     if (idx > 0 && /^\d+$/.test(hh.slice(idx + 1))) {
@@ -182,14 +269,17 @@ function parseConnectTarget(headBuf) {
   return target.trim();
 }
 
-const parser = new PacketParser((type, data) => {
+function onTunnelPacket(type, data) {
   if (type === MSG_HANDSHAKE && !handshakeDone) {
     const pubLen = data.readUInt16BE(0);
     const sPubDer = data.subarray(2, 2 + pubLen);
     const sig = data.subarray(2 + pubLen);
 
     if (!verifyData(sPubDer, sig, serverPubKey)) {
-      tunnelSocket.destroy();
+      console.error("Сервер не прошёл проверку подписи. Закрываю.");
+      try {
+        tunnelSocket?.destroy();
+      } catch {}
       return;
     }
 
@@ -205,12 +295,18 @@ const parser = new PacketParser((type, data) => {
     const h = Buffer.alloc(5);
     h.writeUInt32BE(myPubDer.length, 0);
     h.writeUInt8(MSG_HANDSHAKE, 4);
+
     tunnelSocket.write(Buffer.concat([h, myPubDer]));
 
     handshakeDone = true;
-    console.error("Личность подтверждена.");
+    reconnectAttempt = 0;
 
-    while (pendingSend.length) sendEncrypted(pendingSend.shift());
+    console.error("Личность подтверждена. Туннель готов.");
+
+    while (pendingSend.length) {
+      const buf = pendingSend.shift();
+      if (buf) sendEncrypted(buf);
+    }
     return;
   }
 
@@ -221,11 +317,14 @@ const parser = new PacketParser((type, data) => {
     msg = decrypt(data, sharedKey, rSeq++);
   } catch (e) {
     console.error("Error decrypting data:", e);
-    tunnelSocket.destroy();
+    try {
+      tunnelSocket?.destroy();
+    } catch {}
     return;
   }
 
   if (msg.length < 5) return;
+
   const op = msg.readUInt8(0);
   const connId = msg.readUInt32BE(1);
   const payload = msg.subarray(5);
@@ -264,25 +363,61 @@ const parser = new PacketParser((type, data) => {
     clientSockets.delete(connId);
     return;
   }
-});
+}
 
-tunnelSocket.on("data", (d) => parser.add(d));
-tunnelSocket.on("error", (e) => console.error("Tunnel error:", e));
-tunnelSocket.on("close", () => {
-  for (const [, s] of clientSockets) {
-    try {
-      s.destroy();
-    } catch {}
+function connectTunnel() {
+  if (shuttingDown) return;
+
+  destroyTunnelSocket();
+  cleanupActiveWork(new Error("Tunnel reconnecting"));
+  resetCryptoState();
+
+  tunnelSocket = new net.Socket();
+  tunnelSocket.setNoDelay(true);
+
+  parser = new PacketParser(onTunnelPacket);
+
+  tunnelSocket.on("data", (d) => parser.add(d));
+
+  tunnelSocket.on("connect", () => {
+    console.error("Подключение к туннелю...");
+  });
+
+  tunnelSocket.on("error", (e) => {
+    console.error("Tunnel error:", e?.message || e);
+  });
+
+  tunnelSocket.on("close", () => {
+    if (shuttingDown) return;
+
+    handshakeDone = false;
+    sharedKey = null;
+
+    cleanupActiveWork(new Error("Tunnel closed"));
+    scheduleReconnect("close");
+  });
+
+  try {
+    tunnelSocket.connect(PORT, HOST);
+  } catch (e) {
+    scheduleReconnect("connect throw");
   }
-  clientSockets.clear();
-});
-
-tunnelSocket.connect(PORT, HOST, () => {
-  console.error("Подключение к туннелю...");
-});
+}
 
 const proxyServer = net.createServer(async (clientSocket) => {
   clientSocket.setNoDelay(true);
+
+  if (!isTunnelReady()) {
+    try {
+      clientSocket.write(
+        "HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n"
+      );
+    } catch {}
+    try {
+      clientSocket.destroy();
+    } catch {}
+    return;
+  }
 
   const connId = genConnId();
   clientSockets.set(connId, clientSocket);
@@ -291,12 +426,12 @@ const proxyServer = net.createServer(async (clientSocket) => {
     if (clientSockets.has(connId)) {
       clientSockets.delete(connId);
       try {
-        sendOp(OP_CLOSE, connId);
+        if (isTunnelReady()) sendOp(OP_CLOSE, connId);
+      } catch {}
+      try {
+        clientSocket.destroy();
       } catch {}
     }
-    try {
-      clientSocket.destroy();
-    } catch {}
   };
 
   try {
@@ -313,13 +448,23 @@ const proxyServer = net.createServer(async (clientSocket) => {
 
       if (rest.length) sendOp(OP_DATA, connId, rest);
 
-      clientSocket.on("data", (chunk) => sendOp(OP_DATA, connId, chunk));
+      clientSocket.on("data", (chunk) => {
+        try {
+          sendOp(OP_DATA, connId, chunk);
+        } catch {
+          kill();
+        }
+      });
+
       clientSocket.on("close", () => {
         if (clientSockets.has(connId)) {
           clientSockets.delete(connId);
-          sendOp(OP_CLOSE, connId);
+          try {
+            if (isTunnelReady()) sendOp(OP_CLOSE, connId);
+          } catch {}
         }
       });
+
       clientSocket.on("error", kill);
       return;
     }
@@ -345,14 +490,23 @@ const proxyServer = net.createServer(async (clientSocket) => {
     sendOp(OP_DATA, connId, fwd.bytes);
     if (rest.length) sendOp(OP_DATA, connId, rest);
 
-    clientSocket.on("data", (chunk) => sendOp(OP_DATA, connId, chunk));
+    clientSocket.on("data", (chunk) => {
+      try {
+        sendOp(OP_DATA, connId, chunk);
+      } catch {
+        kill();
+      }
+    });
 
     clientSocket.on("close", () => {
       if (clientSockets.has(connId)) {
         clientSockets.delete(connId);
-        sendOp(OP_CLOSE, connId);
+        try {
+          if (isTunnelReady()) sendOp(OP_CLOSE, connId);
+        } catch {}
       }
     });
+
     clientSocket.on("error", kill);
   } catch (e) {
     try {
@@ -367,4 +521,17 @@ const proxyServer = net.createServer(async (clientSocket) => {
 proxyServer.listen(LOCAL_PROXY_PORT, () => {
   console.error(`Local proxy запущен на порту ${LOCAL_PROXY_PORT}`);
   console.error(`Configure browser proxy: 127.0.0.1:${LOCAL_PROXY_PORT}`);
+});
+
+connectTunnel();
+
+process.on("SIGINT", () => {
+  shuttingDown = true;
+  try {
+    proxyServer.close();
+  } catch {}
+  try {
+    destroyTunnelSocket();
+  } catch {}
+  process.exit(0);
 });
